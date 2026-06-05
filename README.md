@@ -1,29 +1,32 @@
 # cutemoe
 
-**A Mixture-of-Experts token dispatch + expert GEMM, fused into one GPU kernel.**
+**One GPU kernel that does the two heavy steps of a Mixture-of-Experts layer — moving tokens between GPUs, and the expert matmuls — at the same time, instead of one after the other.**
 
-The all-to-all token shuffle and the expert matmul run in a single launch — so the network traffic hides under the math.
-
-~**300 TFLOP/s/GPU**, bf16, on 8×H100, at a real Qwen3-30B-A3B shape.
+~**300 TFLOP/s/GPU**, bf16, on 8×H100.
 
 ---
 
 ## What is this?
 
-[Mixture-of-Experts](https://en.wikipedia.org/wiki/Mixture_of_experts) layers route each token to a few "expert" sub-networks.
+A [Mixture-of-Experts](https://en.wikipedia.org/wiki/Mixture_of_experts) (MoE) layer swaps one big feed-forward block for many small ones — the "experts" — and sends each token through only a few of them. Many more parameters, roughly the same compute per token.
 
-In expert-parallel training the experts live on different GPUs. So every step, each GPU must:
+To train a large MoE, you spread those experts across many GPUs.
 
-1. **send** — scatter each token to the GPUs that own its top-k experts (all-to-all over NVLink), then
-2. **compute** — a grouped matmul over whatever tokens it received.
+That creates a problem: a token sitting on GPU 0 might be routed to experts that live on GPU 3 and GPU 5.
 
-Run those as two kernels and you pay `comm + compute`, back to back.
+So every training step has two phases:
 
-Fuse them into one kernel and the comm hides under the compute — closer to `max(comm, compute)`.
+**1. Dispatch** *(networking)* — each GPU sends every token to the GPUs that hold its experts. A cross-GPU all-to-all over NVLink.
 
-That fusion is the idea in the **UniEP** paper ([arXiv:2604.19241](https://arxiv.org/abs/2604.19241)).
+**2. Expert GEMM** *(compute)* — each GPU does a batched matmul over the tokens it just received: one matmul per expert, packed back to back — a *grouped GEMM*.
 
-**This repo is a faithful [CuteDSL](https://docs.nvidia.com/cutlass/latest/media/docs/pythonDSL/cute_dsl.html) port of its dispatch+GEMM mega-kernel** (originally written in Triton — see [References](#references)).
+Do them as two separate kernels and you pay for both in series: `comm + compute`.
+
+**This fuses them into one kernel.** The moment a token lands, the GPU can start its matmul — so the networking happens *underneath* the math instead of before it. The cost drops toward `max(comm, compute)`.
+
+That overlap is the idea in the **UniEP** paper ([arXiv:2604.19241](https://arxiv.org/abs/2604.19241)).
+
+This repo is a faithful [CuteDSL](https://docs.nvidia.com/cutlass/latest/media/docs/pythonDSL/cute_dsl.html) port of UniEP's dispatch+GEMM kernel (originally written in Triton — see [References](#references)).
 
 ---
 
