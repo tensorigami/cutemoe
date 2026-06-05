@@ -1,0 +1,13 @@
+# env
+.venv/
+__pycache__/
+*.pyc
+
+# weights / data (never commit)
+*.safetensors
+*.bin
+weights/
+
+# logs / scratch
+*.log
+.DS_Store

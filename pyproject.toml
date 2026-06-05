@@ -1,0 +1,63 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cute-test"
+version = "0.1.0"
+description = "CuTe DSL/NVSHMEM"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "einops>=0.7",
+  "numpy>=1.26.0",
+  "packaging>=23",
+  "psutil>=5.9",
+  "typing-extensions>=4.8",
+]
+
+[project.optional-dependencies]
+torch = [
+  "torch>=2.4",
+]
+cute = [
+  "Cython>=0.29.24",
+  "cuda-python>=12.8.0",
+  "cuda-core[cu12]>=1.0",  # nvshmem4py 0.3.0 targets the cuda-core 1.0 API (mentor's working combo)
+  "ninja>=1.11",
+  "nvshmem4py-cu12==0.3.0",  # 0.3.0 has device-side cute bindings; 0.1.0 does not
+  "nvidia-cutlass-dsl==4.4.2",
+  "nvidia-nvshmem-cu12>=3.3.9",
+  "mpi4py>=4",  # multi-GPU bootstrap for nvshmem (built against system OpenMPI)
+]
+
+test = [
+  "pytest>=8",
+  "pytest-xdist>=3.5",
+  "torch>=2.4",
+]
+
+dev = [
+  "cute-test[cute,test,torch]",
+  "black>=24",
+  "mypy>=1.8",
+  "ruff>=0.4",
+]
+
+bench = [
+  "pandas>=2.0",
+  "tabulate>=0.9",
+]
+
+all = [
+  "cute-test[bench,cute,dev,test,torch]",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-q"
+cache_dir = "/tmp/cute-test-pytest-cache"
