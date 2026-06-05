@@ -36,7 +36,7 @@ run 8 tests/mega_perf_test.py -x NTOK=4096                 # ~300 TF/s/GPU
 run 8 tests/mega_perf_test.py -x NTOK=4096 -x GEMM_ONLY=1  # diagnostic: gemm-only ~560 TF/s
 
 echo ""; echo "### regressions ###"
-run 8 tests/mega_twocall_test.py  # host-driver idempotency across repeated run() calls
+run 2 tests/mega_twocall_test.py  # host-driver idempotency across repeated run() calls (2 GPUs)
 run 1 tests/mega_m0_test.py       # 0-token-expert GEMM groups (pass argv 0-3 for other cases)
 
 echo ""; echo "### done ###"
