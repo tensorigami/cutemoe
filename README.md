@@ -149,8 +149,8 @@ uv.lock
 A re-implementation — the algorithm and structure aren't ours. Please cite the originals:
 
 - **UniEP: Unified Expert-Parallel MoE MegaKernel for LLM Training** — the work this kernel comes from. [arXiv:2604.19241](https://arxiv.org/abs/2604.19241)
-- **[Triton-distributed](https://github.com/ByteDance-Seed/Triton-distributed)** (ByteDance-Seed) — the Triton implementation we ported (`mega_kernel_dispatch_token_moe_grouped_gemm` in `ep_all2all_fused.py`). [paper](https://arxiv.org/abs/2504.19442)
-- **[NVIDIA CUTLASS](https://github.com/NVIDIA/cutlass)** — the Hopper grouped-GEMM example this is built on (the GEMM machinery is upstream). See `LICENSE`.
+- **Triton-distributed** (ByteDance-Seed) — reference implementation: [`mega_kernel_dispatch_token_moe_grouped_gemm`](https://github.com/ByteDance-Seed/Triton-distributed/blob/main/python/triton_dist/kernels/nvidia/ep_all2all_fused.py). [repo](https://github.com/ByteDance-Seed/Triton-distributed) · [paper](https://arxiv.org/abs/2504.19442)
+- **[CuteDSL](https://docs.nvidia.com/cutlass/latest/media/docs/pythonDSL/cute_dsl.html)** — the GPU kernel DSL this is written in; the GEMM machinery starts from its Hopper grouped-GEMM example. See `LICENSE`.
 
 ## License
 
