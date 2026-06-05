@@ -1,6 +1,6 @@
 # cutemoe
 
-**One GPU kernel that does the two heavy steps of a Mixture-of-Experts layer — moving tokens between GPUs, and the expert matmuls — at the same time, instead of one after the other.**
+**A single CuteDSL kernel that overlaps the two cross-GPU steps of a Mixture-of-Experts layer: routing each token to the GPUs that hold its experts, and the expert matmuls.**
 
 ~**300 TFLOP/s/GPU**, bf16, on 8×H100.
 
@@ -69,19 +69,17 @@ A token's GEMM can't start until its tokens have arrived — so the bell is the 
 
 The pieces that make it correct and fast (all in `mega_kernel.py`):
 
-- **whole-CTA dispatch** — every warp of the CTA issues puts, not just one. This is the single biggest perf lever (see below).
+- **whole-CTA dispatch** — every warp of the CTA issues puts, so the communication runs at full bandwidth instead of bottlenecking the GEMM. The main perf lever.
 - **dynamic ticket schedule** — one atomic counter feeds both crews; a shared-memory slot + a named barrier keep the load warp and the MMA warps on the same ticket.
 - **bf16** — Hopper does bf16 natively; the dispatch moves raw bytes (it's dtype-agnostic), so it just works once the GEMM dtype gate allows it.
 
-### The perf story: 151 → ~300
+### Performance
 
-First end-to-end number: **151 TF/s**.
+End to end: **~300 TF/s/GPU**.
 
-Turn dispatch off (same kernel, GEMM only): **~560 TF/s**. So the GEMM was fine — the gap was all comm.
+With dispatch turned off (GEMM only), the same kernel runs at **~560 TF/s** — so the GEMM isn't the bottleneck; the gap is communication that isn't fully hidden yet.
 
-The cause: we'd taken a shortcut and run dispatch on **one warp** per tile (~142 GB/s vs ~450 GB/s NVLink).
-
-The reference uses the **whole CTA**. Restoring that cut the comm ~3× and took the number **151 → ~300**.
+That's the headroom the **two-stage** variant below would chase.
 
 ### Scope: one-stage vs two-stage
 
