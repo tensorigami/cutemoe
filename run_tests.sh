@@ -31,6 +31,12 @@ run 2 tests/mega_sweep_test.py    # 15 randomized routings vs play.py
 run 2 tests/mega_weight_test.py   # gating-weight transfer (HAS_WEIGHT)
 run 8 tests/mega_scale_test.py    # the real architecture, 8 GPUs
 
+echo ""; echo "### two-stage (this branch) ###"
+run 2 tests/mega_twostage_test.py                        # two-stage end-to-end (fp16)
+run 2 tests/mega_twostage_sweep_test.py                  # 15 routings, two-stage vs play.py
+run 8 tests/mega_twostage_scale_test.py -x NUM_TAIL=16   # the real architecture, two-stage
+run 8 tests/mega_twostage_perf_test.py -x NTOK=4096 -x NUM_TAIL=16  # ~184 TF/s/GPU (see README)
+
 echo ""; echo "### performance ###"
 run 8 tests/mega_perf_test.py -x NTOK=4096                 # ~300 TF/s/GPU
 run 8 tests/mega_perf_test.py -x NTOK=4096 -x GEMM_ONLY=1  # diagnostic: gemm-only ~560 TF/s

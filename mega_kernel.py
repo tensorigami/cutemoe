@@ -606,6 +606,11 @@ class HopperGroupedGemmPersistentKernel:
         d_wsend: cute.Tensor,
         d_wrecv: cute.Tensor,
         has_weight: cutlass.Constexpr[bool],
+        d_stage: cute.Tensor,
+        d_final: cute.Tensor,
+        d_rank: cute.Tensor,
+        d_indirect: cute.Tensor,
+        num_tail: cutlass.Constexpr[int],
         stream: cuda.CUstream,
     ):
         """Execute the grouped GEMM operation.
@@ -733,6 +738,11 @@ class HopperGroupedGemmPersistentKernel:
             d_wsend,
             d_wrecv,
             has_weight,
+            d_stage,
+            d_final,
+            d_rank,
+            d_indirect,
+            num_tail,
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -779,6 +789,11 @@ class HopperGroupedGemmPersistentKernel:
         d_wsend: cute.Tensor,
         d_wrecv: cute.Tensor,
         has_weight: cutlass.Constexpr[bool],
+        d_stage: cute.Tensor,
+        d_final: cute.Tensor,
+        d_rank: cute.Tensor,
+        d_indirect: cute.Tensor,
+        num_tail: cutlass.Constexpr[int],
     ):
         """
         GPU device kernel performing the batched GEMM computation.
@@ -984,6 +999,12 @@ class HopperGroupedGemmPersistentKernel:
         # set (32 + num_mma_threads) as tensormap_ab_init_barrier, which is already
         # proven in this kernel. barrier_id 3 (0=cluster, 1=epilog, 2=tensormap).
         ticket_bar = pipeline.NamedBarrier(barrier_id=3, num_threads=32 + self.num_mma_threads)
+        # Two-stage COPY-stage barrier: the participating dispatch warps (load + MMA,
+        # same set as ticket_bar) sync after each expert's rows are replicated, before
+        # the load warp rings that expert's bell. A plain __syncthreads() would hang on
+        # the parked DMA warps 1-3; this barrier excludes them. barrier_id 4 (0=cluster,
+        # 1=epilog, 2=tensormap, 3=ticket). Only arrived-at when num_tail>0.
+        copy_bar = pipeline.NamedBarrier(barrier_id=4, num_threads=32 + self.num_mma_threads)
 
         if is_dma_warp_group:
             cute.arch.warpgroup_reg_dealloc(self.load_register_requirement)
@@ -1058,54 +1079,66 @@ class HopperGroupedGemmPersistentKernel:
                 cur_k_tile_cnt = grouped_info.cta_tile_count_k * (cutlass.Int32(1) - is_disp_i)
 
                 if is_disp_i == 1:
-                    # Crew A dispatch: this load warp is dispatch-warp 0 of the CTA; the
-                    # MMA warps take 1..n_disp_warps-1 (inlined identically in the MMA loop
-                    # below). Global slot = ticket*n_disp_warps + _wofs (here _wofs=0).
-                    _epr = num_experts // world_size
-                    _my = _nv_direct.my_pe()
-                    _lane = tidx % 32
-                    _tot = cute.size(d_topk)
-                    _so = ticket * n_disp_warps
-                    while _so < _tot:
-                        _e = d_topk[_so]
-                        if _e >= 0:  # ignore dropped tokens
-                            _slot = d_scatter[_so]
-                            _tok = _so // top_k
-                            _er = _e // _epr
-                            _nv_rma.put_warp(d_output[_slot, None], d_input[_tok, None], _er)
-                            if cutlass.const_expr(has_weight):
-                                # HAS_WEIGHT (ref L134-136): parallel gating-weight put.
-                                _nv_rma.put_warp(d_wrecv[_slot, None], d_wsend[_so, None], _er)
-                            cute.arch.sync_warp()
+                    if cutlass.const_expr(num_tail == 0):
+                        # ── ONE-STAGE dispatch (load warp = dispatch-warp 0) ──────────
+                        # Direct put to the final inbox + runtime-atomic per-expert bell.
+                        _epr = num_experts // world_size
+                        _my = _nv_direct.my_pe()
+                        _lane = tidx % 32
+                        _tot = cute.size(d_topk)
+                        _so = ticket * n_disp_warps
+                        while _so < _tot:
+                            _e = d_topk[_so]
+                            if _e >= 0:  # ignore dropped tokens
+                                _slot = d_scatter[_so]
+                                _tok = _so // top_k
+                                _er = _e // _epr
+                                _nv_rma.put_warp(d_output[_slot, None], d_input[_tok, None], _er)
+                                if cutlass.const_expr(has_weight):
+                                    # HAS_WEIGHT (ref L134-136): parallel gating-weight put.
+                                    _nv_rma.put_warp(d_wrecv[_slot, None], d_wsend[_so, None], _er)
+                                cute.arch.sync_warp()
+                                if _lane == 0:
+                                    _old = cute.arch.atomic_add(
+                                        d_bellctr[_e, None].iterator, 1, sem="relaxed", scope="gpu"
+                                    )
+                                    if _old == d_splits[_e] - 1:
+                                        _nv_rma.fence()  # PE-scoped: orders puts (ref L142)
+                                        _bi = (_e % _epr) * world_size + _my
+                                        _nv_direct.signal_op(barriers[_bi, None], 1, _NV_SET, _er)
+                            _so += num_dispatch * n_disp_warps
+                        # empty-expert eager ring: tile 0, load-warp lane 0 rings experts
+                        # this rank owes 0 copies (one warp does it, not per dispatch warp).
+                        if ticket == 0:
                             if _lane == 0:
-                                _old = cute.arch.atomic_add(
-                                    d_bellctr[_e, None].iterator, 1, sem="relaxed", scope="gpu"
-                                )
-                                if _old == d_splits[_e] - 1:
-                                    _nv_rma.fence()  # PE-scoped: orders all warps' puts (ref L142)
-                                    _bi = (_e % _epr) * world_size + _my
-                                    _nv_direct.signal_op(barriers[_bi, None], 1, _NV_SET, _er)
-                        _so += num_dispatch * n_disp_warps
-                    # empty-expert eager ring: tile 0, load-warp lane 0 rings experts
-                    # this rank owes 0 copies (one warp does it, not per dispatch warp).
-                    if ticket == 0:
-                        if _lane == 0:
-                            for _ee in cutlass.range_constexpr(num_experts):
-                                if d_splits[_ee] == 0:
-                                    _own = _ee // _epr
-                                    _bi = (_ee % _epr) * world_size + _my
-                                    _nv_direct.signal_op(barriers[_bi, None], 1, _NV_SET, _own)
+                                for _ee in cutlass.range_constexpr(num_experts):
+                                    if d_splits[_ee] == 0:
+                                        _own = _ee // _epr
+                                        _bi = (_ee % _epr) * world_size + _my
+                                        _nv_direct.signal_op(barriers[_bi, None], 1, _NV_SET, _own)
+                    else:
+                        # ── TWO-STAGE dispatch (ref ..._two_stage, load warp _wofs=0) ──
+                        self._dispatch_two_stage(
+                            ticket, cutlass.Int32(0), num_dispatch, num_tail,
+                            num_experts, world_size, top_k, has_weight, tidx,
+                            d_topk, d_scatter, d_input, d_stage, d_rank, d_indirect,
+                            d_wsend, d_wrecv, d_final, problem_sizes_mnkl, barriers,
+                        )
 
                 if cur_k_tile_cnt != 0:
                     is_group_changed = cur_group_idx != last_group_idx
 
                     if is_group_changed:
                         # Crew B bell gate (the reference's NEED_WAIT): before loading
-                        # expert cur_group_idx's rows, wait until every sender has
-                        # delivered them (barriers[group, sender] >= 1).
-                        for _s in cutlass.range_constexpr(world_size):
-                            _bi = cur_group_idx * world_size + _s
-                            _nv_direct.signal_wait(barriers[_bi, None], _NV_CMP_GE, 1)
+                        # expert cur_group_idx's rows, wait until they're delivered.
+                        if cutlass.const_expr(num_tail == 0):
+                            # one-stage: per-sender bells (ref L796-799), one per (expert,sender)
+                            for _s in cutlass.range_constexpr(world_size):
+                                _bi = cur_group_idx * world_size + _s
+                                _nv_direct.signal_wait(barriers[_bi, None], _NV_CMP_GE, 1)
+                        else:
+                            # two-stage: ONE bell per expert, rung by the COPY (ref L792-794)
+                            _nv_direct.signal_wait(barriers[cur_group_idx, None], _NV_CMP_GE, 1)
                         real_a = self.make_tensor_for_tensormap_update(
                             cur_group_idx,
                             self.a_dtype,
@@ -1514,37 +1547,47 @@ class HopperGroupedGemmPersistentKernel:
                     # Whole-CTA dispatch: this MMA warp is dispatch-warp 1+(its index).
                     # On a dispatch ticket the gemm body above is skipped, so these warps
                     # drive puts alongside the load warp instead of idling at ticket_bar.
-                    # Inlined identically to the load block (cute forbids a captured
-                    # closure in dynamic control flow); only _wofs differs.
+                    # Only _wofs differs from the load block (load=0, MMA warp k=1+k).
                     _mma_warp = cute.arch.make_warp_uniform(
                         (tidx - self.num_dma_warp_groups * self.num_threads_per_warp_group)
                         // 32
                     )
                     _wofs = cutlass.Int32(1) + _mma_warp
-                    _epr = num_experts // world_size
-                    _my = _nv_direct.my_pe()
-                    _lane = tidx % 32
-                    _tot = cute.size(d_topk)
-                    _so = ticket * n_disp_warps + _wofs
-                    while _so < _tot:
-                        _e = d_topk[_so]
-                        if _e >= 0:  # ignore dropped tokens
-                            _slot = d_scatter[_so]
-                            _tok = _so // top_k
-                            _er = _e // _epr
-                            _nv_rma.put_warp(d_output[_slot, None], d_input[_tok, None], _er)
-                            if cutlass.const_expr(has_weight):
-                                _nv_rma.put_warp(d_wrecv[_slot, None], d_wsend[_so, None], _er)
-                            cute.arch.sync_warp()
-                            if _lane == 0:
-                                _old = cute.arch.atomic_add(
-                                    d_bellctr[_e, None].iterator, 1, sem="relaxed", scope="gpu"
-                                )
-                                if _old == d_splits[_e] - 1:
-                                    _nv_rma.fence()  # PE-scoped: orders all warps' puts (ref L142)
-                                    _bi = (_e % _epr) * world_size + _my
-                                    _nv_direct.signal_op(barriers[_bi, None], 1, _NV_SET, _er)
-                        _so += num_dispatch * n_disp_warps
+                    if cutlass.const_expr(num_tail == 0):
+                        # ── ONE-STAGE dispatch (inlined; cute forbids a captured closure
+                        # in dynamic control flow, and this path predates the method) ──
+                        _epr = num_experts // world_size
+                        _my = _nv_direct.my_pe()
+                        _lane = tidx % 32
+                        _tot = cute.size(d_topk)
+                        _so = ticket * n_disp_warps + _wofs
+                        while _so < _tot:
+                            _e = d_topk[_so]
+                            if _e >= 0:  # ignore dropped tokens
+                                _slot = d_scatter[_so]
+                                _tok = _so // top_k
+                                _er = _e // _epr
+                                _nv_rma.put_warp(d_output[_slot, None], d_input[_tok, None], _er)
+                                if cutlass.const_expr(has_weight):
+                                    _nv_rma.put_warp(d_wrecv[_slot, None], d_wsend[_so, None], _er)
+                                cute.arch.sync_warp()
+                                if _lane == 0:
+                                    _old = cute.arch.atomic_add(
+                                        d_bellctr[_e, None].iterator, 1, sem="relaxed", scope="gpu"
+                                    )
+                                    if _old == d_splits[_e] - 1:
+                                        _nv_rma.fence()  # PE-scoped: orders puts (ref L142)
+                                        _bi = (_e % _epr) * world_size + _my
+                                        _nv_direct.signal_op(barriers[_bi, None], 1, _NV_SET, _er)
+                            _so += num_dispatch * n_disp_warps
+                    else:
+                        # ── TWO-STAGE dispatch (MMA warp _wofs=1+k); same method as load ──
+                        self._dispatch_two_stage(
+                            ticket, _wofs, num_dispatch, num_tail,
+                            num_experts, world_size, top_k, has_weight, tidx,
+                            d_topk, d_scatter, d_input, d_stage, d_rank, d_indirect,
+                            d_wsend, d_wrecv, d_final, problem_sizes_mnkl, barriers,
+                        )
 
                 # Next ticket: wait at barrier (A), the load-warp leader advances
                 # the counter between (A) and (B), barrier (B) publishes it, read.
@@ -1555,6 +1598,111 @@ class HopperGroupedGemmPersistentKernel:
                 ticket = ticket_smem[0]
 
             tma_store_pipeline.producer_tail()
+
+    @cute.jit
+    def _dispatch_two_stage(
+        self,
+        ticket: cutlass.Int32,
+        wofs: cutlass.Int32,
+        num_dispatch: cutlass.Constexpr[int],
+        num_tail: cutlass.Constexpr[int],
+        num_experts: cutlass.Constexpr[int],
+        world_size: cutlass.Constexpr[int],
+        top_k: cutlass.Constexpr[int],
+        has_weight: cutlass.Constexpr[bool],
+        tidx: cutlass.Int32,
+        d_topk: cute.Tensor,
+        d_scatter: cute.Tensor,
+        d_input: cute.Tensor,
+        d_stage: cute.Tensor,
+        d_rank: cute.Tensor,
+        d_indirect: cute.Tensor,
+        d_wsend: cute.Tensor,
+        d_wrecv: cute.Tensor,
+        d_final: cute.Tensor,
+        problem_sizes_mnkl: cute.Tensor,
+        barriers: cute.Tensor,
+    ):
+        """Two-stage dispatch tile (ref tile_kernel_dispatch_token_intra_node_two_stage).
+
+        SEND tickets (< num_dispatch - num_tail) put each token to its destination GPU
+        ONCE (deduped via d_rank) into the staging buffer d_stage, then value-carry the
+        landing slot into the receiver's d_indirect. COPY tickets (the tail) spin on
+        d_indirect, locally replicate d_stage -> d_final for this rank's experts, and
+        ring the per-expert bells. Whole-CTA: load warp = wofs 0, MMA warp k = 1+k.
+        Called from BOTH the load and MMA blocks (a @cute.jit method, not a closure, so
+        it is legal inside the ticket loop's dynamic control flow).
+        """
+        _epr = num_experts // world_size
+        n_disp_warps = 1 + self.num_mma_threads // 32
+        _my = _nv_direct.my_pe()
+        _lane = tidx % 32
+        copy_bar = pipeline.NamedBarrier(barrier_id=4, num_threads=32 + self.num_mma_threads)
+
+        if ticket < num_dispatch - num_tail:
+            # ── SEND: deduped put to staging + value-carry the landing slot ──────────
+            _tot = cute.size(d_topk)
+            _so = ticket * n_disp_warps + wofs
+            while _so < _tot:
+                _e = d_topk[_so]
+                if _e >= 0:  # ignore dropped tokens
+                    _slot = d_scatter[_so]  # this (token,expert)'s row in the final layout
+                    _tok = _so // top_k
+                    _er = _e // _epr  # destination GPU
+                    # dedup (ref L290-295): -1 means token not yet sent to GPU _er.
+                    _hs = d_rank[_tok, _er]
+                    if _hs < 0:
+                        _hs = _slot
+                        _nv_rma.put_warp(d_stage[_slot, None], d_input[_tok, None], _er)
+                        if cutlass.const_expr(has_weight):
+                            _nv_rma.put_warp(d_wrecv[_slot, None], d_wsend[_so, None], _er)
+                        if _lane == 0:
+                            d_rank[_tok, _er] = _slot  # mark sent
+                    cute.arch.sync_warp()
+                    if _lane == 0:
+                        # ref L298-304: fence orders the staging put before the indirect
+                        # write; rma.p carries the landing slot to the receiver's table.
+                        _nv_rma.fence()
+                        _nv_rma.p(d_indirect[_slot, None], _hs, _er)
+                # stride by the SEND-ticket count (num_dispatch - num_tail), NOT num_dispatch:
+                # only the non-tail tickets run SEND, so partitioning the copy space over
+                # num_dispatch would drop every copy whose virtual ticket lands in the tail
+                # range -> its d_indirect never written -> the COPY spins forever.
+                _so += (num_dispatch - num_tail) * n_disp_warps
+        else:
+            # ── COPY: replicate staging -> final for this rank's experts, ring bells ──
+            _tord = ticket - (num_dispatch - num_tail)  # this COPY ticket's ordinal
+            _ex = _tord
+            while _ex < _epr:  # experts strided across the num_tail COPY tickets
+                _recv = problem_sizes_mnkl[_ex, 0]  # rows received for owned expert _ex (= M)
+                # row base = prefix sum of prior experts' M (groups == owned experts)
+                _base = cutlass.Int32(0)
+                for _gp in cutlass.range_constexpr(_epr):
+                    _base += problem_sizes_mnkl[_gp, 0] * (cutlass.Int32(_gp) < _ex).to(
+                        cutlass.Int32
+                    )
+                _r = wofs  # rows split across the participating warps
+                while _r < _recv:
+                    _off = _base + _r
+                    _ptr = d_indirect[_off, None].iterator
+                    # ref L345-347: spin on the receiver's indirection table (local
+                    # acquire load, scope=sys) until the sender wrote the landing slot.
+                    _hs = cute.arch.load(_ptr, cutlass.Int32, sem="acquire", scope="sys")
+                    while _hs < 0:
+                        _hs = cute.arch.load(_ptr, cutlass.Int32, sem="acquire", scope="sys")
+                    # local replicate (ref copy_warp). put-to-self: nvshmem lowers a
+                    # self-PE put to an optimized local memcpy — measured FASTER here than
+                    # a hand-rolled autovec gmem->rmem->gmem copy (184 vs 123 TF/s).
+                    _nv_rma.put_warp(d_final[_off, None], d_stage[_hs, None], _my)
+                    _r += n_disp_warps
+                copy_bar.arrive_and_wait()  # all dispatch warps done with this expert
+                if tidx == 0:
+                    cute.arch.fence_acq_rel_sys()  # copies visible before the bell
+                    # ONE bell per expert (ref L359: st(barriers + expert_idx, 1)) — in
+                    # two-stage every row is ready at once after the copy, so the per-sender
+                    # bell grid is unnecessary; the two-stage GEMM waits on this single bell.
+                    _nv_direct.signal_op(barriers[_ex, None], 1, _NV_SET, _my)
+                _ex += num_tail
 
     @cute.jit
     def make_tensor_for_tensormap_update(
@@ -2200,6 +2348,11 @@ def run(
     a_base_ptrs=None,
     d_wsend_cute=None,
     d_wrecv_cute=None,
+    num_tail: int = 0,
+    d_stage_cute=None,
+    d_final_cute=None,
+    d_rank_cute=None,
+    d_indirect_cute=None,
     bench_iters: int = 0,
     bench_warmup: int = 0,
     reset_fn=None,
@@ -2372,6 +2525,17 @@ def run(
         d_wsend_cute = _dummy((1, 1), torch.float32)
         d_wrecv_cute = _dummy((1, 1), torch.float32)
 
+    # Two-stage (ref NUM_TAIL_SMS>0): staging buffer + final/GEMM-A + dedup rank
+    # table + indirection table. num_tail=0 is pure one-stage; the two-stage branch
+    # is compiled out and these dummies are never read. d_stage/d_final carry token
+    # rows (a_dtype); d_rank/d_indirect are int32 (the indirection scalars are 2-D
+    # [.,1] so a `[idx, None]` slice yields a single-element view — see spikes).
+    if d_stage_cute is None:
+        d_stage_cute = _dummy((1, 1), cutlass_torch.dtype(a_dtype))
+        d_final_cute = _dummy((1, 1), cutlass_torch.dtype(a_dtype))
+        d_rank_cute = _dummy((1, 1), torch.int32)
+        d_indirect_cute = _dummy((1, 1), torch.int32)
+
     # Compile kernel
     # Fused mega-kernel: compile via cute_compile_helper so libnvshmem_device.bc is
     # linked AND nvshmem library_init runs (needed for the in-kernel signal_wait).
@@ -2402,6 +2566,11 @@ def run(
         d_wsend_cute,
         d_wrecv_cute,
         has_weight,
+        d_stage_cute,
+        d_final_cute,
+        d_rank_cute,
+        d_indirect_cute,
+        num_tail,
         current_stream,
     )
 
@@ -2432,6 +2601,10 @@ def run(
                 d_output_cute,
                 d_wsend_cute,
                 d_wrecv_cute,
+                d_stage_cute,
+                d_final_cute,
+                d_rank_cute,
+                d_indirect_cute,
                 current_stream,
             )
 
@@ -2475,6 +2648,10 @@ def run(
             d_output_cute,
             d_wsend_cute,
             d_wrecv_cute,
+            d_stage_cute,
+            d_final_cute,
+            d_rank_cute,
+            d_indirect_cute,
             current_stream,
         )
         torch.cuda.synchronize()

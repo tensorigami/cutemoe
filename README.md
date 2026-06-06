@@ -79,15 +79,20 @@ End to end: **~300 TF/s/GPU**.
 
 With dispatch turned off (GEMM only), the same kernel runs at **~560 TF/s** — so the GEMM isn't the bottleneck; the gap is communication that isn't fully hidden yet.
 
-That's the headroom the **two-stage** variant below would chase.
+### Two-stage (this branch)
 
-### Scope: one-stage vs two-stage
+The one-stage kernel sends each (token, expert) copy as its own network put. The reference also has a **two-stage** path (`NUM_TAIL_SMS > 0`): send each token to a destination GPU only *once* (dedup) into a staging buffer, then have receiver-side "tail" workers copy it locally into each of its experts' rows. With top-8 over 8 GPUs a token hits ~5.25 *distinct* GPUs on average, so deduping same-GPU copies removes **~34% of the network sends**.
 
-This is the **one-stage** kernel: dispatch and GEMM share the ticket pool, and each (token, expert) copy is its own network send.
+This branch implements it, faithful to the reference:
 
-The reference also has a **two-stage** path: send each token to a GPU only *once* (dedup), then have dedicated SMs copy it locally into each expert's rows.
+- a deduped **SEND** stage — a per-rank `d_rank` table sends each (token, dest-GPU) once, then a value-carrying acquire/release handshake records the landing slot in the receiver's indirection table;
+- a **COPY** stage — `num_tail` tail workers spin on the handshake, replicate staging → final locally, and ring the bells the GEMM waits on.
 
-That buys **~34% less NVLink traffic** plus a deeper pipeline — the natural next step, not implemented here.
+`num_tail` is the COPY-worker count (a `constexpr` knob, like the reference's `NUM_TAIL_SMS`).
+
+**Correctness.** Two-stage produces the *identical* final layout to one-stage, so the same oracle applies — verified against `play.py` across the e2e check, the 15-routing sweep (empty experts, dropped tokens, idle ranks), and the full 8-GPU real shape, in fp16 and bf16.
+
+**Performance — an honest tradeoff.** At the real shape two-stage runs **~184 TF/s/GPU** (best `num_tail`) versus one-stage's ~300. This isn't a structural shortfall: the COPY stage is drawn from the *same* dynamic ticket pool as in the reference (its `NUM_TAIL_SMS` names tail *tickets*, not dedicated SMs — `if task_id < num_dispatch: dispatch_two_stage(...)`, then `pid >= num_pid - num_tail` does the COPY). Two-stage simply does **more total work** — SEND + a local COPY + GEMM, versus one-stage's SEND + GEMM — and only pays off when the layer is **communication-bound** (NVLink-saturated at production scale), where deduping ~34% of the sends wins back more than the local copy costs. At this shape it doesn't, and the reference's two-stage carries the same tradeoff. So this is the faithful two-stage: correct, structurally matched, with the perf characterization that says *use it when you're comm-bound, not otherwise*.
 
 ---
 
